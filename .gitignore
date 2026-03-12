@@ -1,2 +1,4 @@
-node_modules/
-.env
+echo "__pycache__/" >> .gitignore
+echo "*.pyc" >> .gitignore
+echo ".env" >> .gitignore
+echo ".venv/" >> .gitignore
