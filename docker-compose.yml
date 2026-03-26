@@ -1,12 +1,13 @@
-version: '3.8'
+version: "3.8"
 
 services:
   gateway:
     build: ./gateway
+    container_name: gateway
     ports:
-      - "8080:8080" # WebSockets and frontend access
-    networks:
-      - raft-network
+      - "8000:8000"
+    environment:
+      - REPLICA_URLS=http://replica1:8001,http://replica2:8002,http://replica3:8003
     depends_on:
       - replica1
       - replica2
@@ -14,40 +15,32 @@ services:
 
   replica1:
     build: ./replica1
-    environment:
-      - REPLICA_ID=1
-      - PORT=3000
+    container_name: replica1
     ports:
-      - "3001:3000"
-    volumes:
-      - ./replica1:/app # Bind mount for hot-reload
-    networks:
-      - raft-network
+      - "8001:8001"
+    environment:
+      - ID=1
 
   replica2:
     build: ./replica2
-    environment:
-      - REPLICA_ID=2
-      - PORT=3000
+    container_name: replica2
     ports:
-      - "3002:3000"
-    volumes:
-      - ./replica2:/app
-    networks:
-      - raft-network
+      - "8002:8002"
+    environment:
+      - ID=2
 
   replica3:
     build: ./replica3
-    environment:
-      - REPLICA_ID=3
-      - PORT=3000
+    container_name: replica3
     ports:
-      - "3003:3000"
-    volumes:
-      - ./replica3:/app
-    networks:
-      - raft-network
+      - "8003:8003"
+    environment:
+      - ID=3
 
-networks:
-  raft-network:
-    driver: bridge # Shared Docker network
+  frontend:
+    build: ./frontend
+    container_name: frontend
+    ports:
+      - "8080:80"
+    depends_on:
+      - gateway
