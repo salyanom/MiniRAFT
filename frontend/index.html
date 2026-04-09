@@ -37,3 +37,276 @@
   </style>
 </head>
 <body>
+
+<header>
+  <h1>Distributed Drawing Board</h1>
+  <div id="status-bar">
+    <span id="ws-badge" class="badge disconnected">disconnected</span>
+    <span id="leader-badge" class="badge leader">leader: unknown</span>
+    <span id="term-badge" style="font-size:11px;color:#94a3b8">term: —</span>
+  </div>
+</header>
+
+<div class="toolbar">
+  <label>Color</label>
+  <div class="color-btn active" style="background:#000000" data-color="#000000" onclick="setColor(this)"></div>
+  <div class="color-btn" style="background:#e74c3c" data-color="#e74c3c" onclick="setColor(this)"></div>
+  <div class="color-btn" style="background:#3498db" data-color="#3498db" onclick="setColor(this)"></div>
+  <div class="color-btn" style="background:#2ecc71" data-color="#2ecc71" onclick="setColor(this)"></div>
+  <div class="color-btn" style="background:#f39c12" data-color="#f39c12" onclick="setColor(this)"></div>
+  <div class="color-btn" style="background:#9b59b6" data-color="#9b59b6" onclick="setColor(this)"></div>
+  <div class="color-btn" style="background:#ffffff; border:1px solid #555" data-color="#ffffff" onclick="setColor(this)"></div>
+  <label style="margin-left:12px">Size</label>
+  <input type="range" id="brush-size" min="1" max="20" value="3"/>
+  <span id="size-label" style="font-size:12px;color:#aaa">3px</span>
+  <button id="clear-btn" onclick="clearCanvas()">Clear</button>
+</div>
+
+<div class="main">
+  <div id="canvas-wrap">
+    <canvas id="canvas" width="1200" height="800"></canvas>
+  </div>
+  <div id="debug-panel">
+    <h3>Cluster state</h3>
+    <div class="stat-row"><span>Connection</span><span id="d-conn">—</span></div>
+    <div class="stat-row"><span>Leader</span><span id="d-leader">—</span></div>
+    <div class="stat-row"><span>Term</span><span id="d-term">—</span></div>
+    <div class="stat-row"><span>Strokes committed</span><span id="d-strokes">0</span></div>
+    <div class="stat-row"><span>Strokes sent</span><span id="d-sent">0</span></div>
+    <div class="stat-row"><span>Pending (queue)</span><span id="d-pending">0</span></div>
+    <div class="stat-row"><span>Avg latency</span><span id="d-latency">—</span></div>
+    <div id="log-list">
+      <h3>Event log</h3>
+      <div id="events"></div>
+    </div>
+  </div>
+</div>
+
+<script>
+  const canvas = document.getElementById('canvas');
+  const ctx    = canvas.getContext('2d');
+
+  // ── Two canvases in one: local layer + remote layer ──────────────────────
+  // We draw local strokes directly on ctx immediately (zero latency feel).
+  // Remote committed strokes also go on the same ctx.
+  // The key insight: we track which strokes WE sent so we don't double-draw them.
+
+  let drawing   = false;
+  let lastX = 0, lastY = 0;
+  let color     = '#000000';
+  let brushSize = 3;
+  let strokesSent = 0;
+  let strokesCommitted = 0;
+  let myClientId = Math.random().toString(36).slice(2); // unique per tab
+  const pendingStrokes = new Map(); // strokeId -> sentAt timestamp
+
+  // Stroke batch queue — accumulate strokes, flush every 16ms (60fps)
+  let strokeBatch = [];
+  let batchTimer  = null;
+
+  // Latency tracking
+  let latencySamples = [];
+
+  function setColor(btn) {
+    document.querySelectorAll('.color-btn').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    color = btn.dataset.color;
+  }
+
+  document.getElementById('brush-size').oninput = function() {
+    brushSize = +this.value;
+    document.getElementById('size-label').textContent = brushSize + 'px';
+  };
+
+  // ── Draw a stroke segment on canvas ──────────────────────────────────────
+  function drawStroke(s) {
+    ctx.beginPath();
+    ctx.moveTo(s.x0, s.y0);
+    ctx.lineTo(s.x1, s.y1);
+    ctx.strokeStyle = s.color;
+    ctx.lineWidth   = s.width;
+    ctx.lineCap     = 'round';
+    ctx.lineJoin    = 'round';
+    ctx.stroke();
+  }
+
+  function clearCanvas() {
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    sendMsg({ type: 'clear' });
+  }
+
+  // ── Mouse input ───────────────────────────────────────────────────────────
+  function getPos(e) {
+    const r = canvas.getBoundingClientRect();
+    if (e.touches) {
+      return { x: e.touches[0].clientX - r.left, y: e.touches[0].clientY - r.top };
+    }
+    return { x: e.clientX - r.left, y: e.clientY - r.top };
+  }
+
+  function startDraw(e) {
+    drawing = true;
+    const p = getPos(e);
+    lastX = p.x; lastY = p.y;
+  }
+
+  function moveDraw(e) {
+    if (!drawing) return;
+    e.preventDefault();
+    const p  = getPos(e);
+    const x1 = p.x, y1 = p.y;
+
+    const strokeId = Math.random().toString(36).slice(2);
+    const stroke = {
+      x0: lastX, y0: lastY, x1, y1,
+      color, width: brushSize,
+      clientId: myClientId,   // tag so we can skip re-drawing our own strokes
+      strokeId,               // unique id for latency tracking
+    };
+
+    // Track when we sent this stroke for latency measurement
+    pendingStrokes.set(strokeId, Date.now());
+
+    // Draw locally IMMEDIATELY — zero latency for the person drawing
+    drawStroke(stroke);
+
+    // Queue for network send (batched)
+    strokeBatch.push(stroke);
+    if (!batchTimer) {
+      batchTimer = setTimeout(flushBatch, 16); // flush at ~60fps
+    }
+
+    strokesSent++;
+    document.getElementById('d-sent').textContent = strokesSent;
+    lastX = x1; lastY = y1;
+  }
+
+  function stopDraw() { drawing = false; }
+
+  canvas.addEventListener('mousedown',  startDraw);
+  canvas.addEventListener('mousemove',  moveDraw);
+  canvas.addEventListener('mouseup',    stopDraw);
+  canvas.addEventListener('mouseleave', stopDraw);
+  canvas.addEventListener('touchstart', e => { e.preventDefault(); startDraw(e); }, { passive: false });
+  canvas.addEventListener('touchmove',  e => { e.preventDefault(); moveDraw(e);  }, { passive: false });
+  canvas.addEventListener('touchend',   stopDraw);
+
+  // ── Batch flush — send all queued strokes in one WS message ──────────────
+  function flushBatch() {
+    batchTimer = null;
+    if (!strokeBatch.length) return;
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      // Send each stroke individually (gateway expects one stroke per message)
+      // but fire them all in the same JS tick — no await between them
+      for (const s of strokeBatch) {
+        ws.send(JSON.stringify({ type: 'stroke', stroke: s }));
+      }
+    }
+    strokeBatch = [];
+  }
+
+  // ── WebSocket ─────────────────────────────────────────────────────────────
+  let ws = null;
+  let reconnectTimer = null;
+
+  function connect() {
+    const wsUrl = `ws://${location.host}/ws`;
+    ws = new WebSocket(wsUrl);
+
+    ws.onopen = () => {
+      setConnected(true);
+      addEvent('Connected to gateway', 'commit');
+      if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+    };
+
+    ws.onmessage = e => {
+      const msg = JSON.parse(e.data);
+
+      if (msg.type === 'stroke') {
+        const s = msg.stroke;
+        // Only draw if it came from a DIFFERENT client tab
+        // Our own strokes are already drawn locally — skip to avoid double-draw
+        if (s.clientId !== myClientId) {
+          drawStroke(s);
+        }
+        // Track latency for our own strokes (round trip time)
+        if (s.clientId === myClientId && s.strokeId && pendingStrokes.has(s.strokeId)) {
+          const rtt = Date.now() - pendingStrokes.get(s.strokeId);
+          pendingStrokes.delete(s.strokeId);
+          latencySamples.push(rtt);
+          if (latencySamples.length > 20) latencySamples.shift();
+          const avg = Math.round(latencySamples.reduce((a,b)=>a+b,0) / latencySamples.length);
+          document.getElementById('d-latency').textContent = avg + ' ms';
+        }
+        strokesCommitted++;
+        document.getElementById('d-strokes').textContent = strokesCommitted;
+      }
+
+      else if (msg.type === 'full_log') {
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        // Each item in msg.log is already a stroke object (not {data: stroke})
+        (msg.log || []).forEach(entry => { if (entry && entry.x != null) drawStroke(entry); });
+        addEvent(`Replayed ${(msg.log||[]).length} strokes from log`, 'commit');
+      }
+
+      else if (msg.type === 'clear') {
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        addEvent('Canvas cleared', 'commit');
+      }
+
+      else if (msg.type === 'leader_change' || msg.type === 'leader') {
+        const id   = msg.leader_id || msg.leaderId || '—';
+        // 'leader' messages on connect don't carry term — fetch it from status
+        const term = msg.term || '—';
+        updateLeader(id, term);
+        addEvent(`New leader: ${id}  term=${term}`, 'election');
+        // If term is missing (initial connect 'leader' msg), fetch it
+        if (!msg.term) {
+          fetch('/api/status').then(r => r.json()).then(data => {
+            if (data && data.term) updateLeader(id, data.term);
+          }).catch(() => {});
+        }
+      }
+    };
+
+    ws.onclose = () => {
+      setConnected(false);
+      addEvent('Disconnected — reconnecting in 2s…', 'error');
+      reconnectTimer = setTimeout(connect, 2000);
+    };
+
+    ws.onerror = () => addEvent('WebSocket error', 'error');
+  }
+
+  function sendMsg(msg) {
+    if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(msg));
+  }
+
+  // ── UI helpers ────────────────────────────────────────────────────────────
+  function setConnected(on) {
+    const b = document.getElementById('ws-badge');
+    b.textContent = on ? 'connected' : 'disconnected';
+    b.className   = 'badge ' + (on ? 'connected' : 'disconnected');
+    document.getElementById('d-conn').textContent = on ? 'yes' : 'no';
+  }
+
+  function updateLeader(id, term) {
+    document.getElementById('leader-badge').textContent = 'leader: ' + id;
+    document.getElementById('term-badge').textContent   = 'term: '   + term;
+    document.getElementById('d-leader').textContent = id;
+    document.getElementById('d-term').textContent   = term;
+  }
+
+  const eventsEl = document.getElementById('events');
+  function addEvent(text, cls) {
+    const div = document.createElement('div');
+    div.className = 'log-entry ' + (cls || '');
+    div.textContent = `[${new Date().toLocaleTimeString()}] ${text}`;
+    eventsEl.prepend(div);
+    if (eventsEl.children.length > 80) eventsEl.lastChild.remove();
+  }
+
+  connect();
+</script>
+</body>
+</html>
